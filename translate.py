@@ -612,8 +612,13 @@ def main() -> int:
                 if (
                     existing
                     and existing.get("source") == raw
-                    and existing.get("api_base") == api_base
-                    and existing.get("model") == model
+                    and (
+                        args.export_cache_only
+                        or (
+                            existing.get("api_base") == api_base
+                            and existing.get("model") == model
+                        )
+                    )
                     and not existing.get("error")
                 ):
                     cached_action = existing.get("action")
