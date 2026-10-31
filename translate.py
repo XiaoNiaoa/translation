@@ -609,7 +609,13 @@ def main() -> int:
                 existing = cache.get(item_id)
                 # 已完成的翻译/保留/人工复核直接复用；请求失败或校验失败的记录允许下次重试。
                 cache_done = False
-                if existing and existing.get("source") == raw and not existing.get("error"):
+                if (
+                    existing
+                    and existing.get("source") == raw
+                    and existing.get("api_base") == api_base
+                    and existing.get("model") == model
+                    and not existing.get("error")
+                ):
                     cached_action = existing.get("action")
                     cache_done = (
                         cached_action == "keep"
@@ -645,6 +651,11 @@ def main() -> int:
     print("API 模型：{} | batch_size={} | max_chars={} | max_tokens={}".format(model, args.batch_size, args.max_chars, args.max_tokens))
 
     review_rows = list(parse_reviews)
+    parse_review_lines = {
+        (row.get("file"), row.get("line"))
+        for row in parse_reviews
+        if row.get("status") == "parse_review"
+    }
     for batch_no, batch in enumerate(batches, 1):
         print("[批次 {}/{}] {} 条字符串".format(batch_no, len(batches), len(batch)))
         try:
@@ -674,7 +685,7 @@ def main() -> int:
             cache[item["id"]] = {
                 "source": item["raw"], "action": action, "translated": translated,
                 "model_text": row["text"], "error": error, "file": item["file"],
-                "line": item["line"], "model": model,
+                "line": item["line"], "model": model, "api_base": api_base,
             }
             if error or action == "review":
                 review_rows.append({
@@ -696,7 +707,7 @@ def main() -> int:
         original_line = entry["original_line"]
         literals, _ = scan_line_literals(original_line)
         edits: List[Tuple[int, int, str]] = []
-        row_review = False
+        row_review = (filepath, line_num) in parse_review_lines
         for literal in literals:
             raw = literal["raw"]
             item_id = make_id(filepath, line_num, literal["start"], raw)
@@ -721,7 +732,10 @@ def main() -> int:
                 translated_strings += 1
 
         new_entry = dict(entry)
-        if edits:
+        if row_review:
+            # 同一源码行中任一字符串需要复核时，整行暂不回写，避免部分修改。
+            new_entry["translated_line"] = ""
+        elif edits:
             new_line = original_line
             for start, end, translated in sorted(edits, key=lambda edit: edit[0], reverse=True):
                 new_line = new_line[:start] + translated + new_line[end:]
