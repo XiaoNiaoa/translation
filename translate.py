@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
-"""通过 DeepSeek API 翻译提取器生成的 translate.json，不扫描或读取 .pwn/.inc 源码文件。
+"""通过用户配置的 OpenAI-compatible Chat Completions API 翻译 JSON，不扫描或读取 .pwn/.inc 源码文件。
 
 用法：
-    set DEEPSEEK_API_KEY=your_key
-    python deepseek_translate_json.py --model deepseek-flash
-    python deepseek_translate_json.py --json translate.json --output translate.translated.json --model deepseek-flash
+    copy translation_config.example.json translation_config.json
+    # 编辑 translation_config.json 后运行
+    python translate.py --config translation_config.json
 
 输出保留原始 file/line/original_line，并为发生变化的行添加 translated_line。
 translated_line 是完整源码行，只替换双引号字符串内部的文本；其他代码字符原样保留。
@@ -25,7 +25,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-DEFAULT_API_BASE = "https://api.deepseek.com"
+DEFAULT_CONFIG = "translation_config.json"
 DEFAULT_JSON = "translate.json"
 DEFAULT_OUTPUT = "translate.translated.json"
 DEFAULT_CACHE = "translation_cache.json"
@@ -290,7 +290,7 @@ def build_json_context(file_entries: Sequence[Dict[str, Any]], line: int, radius
 
 
 def _save_api_debug(content: str, response_data: Dict[str, Any], reason: str) -> None:
-    """保存模型原始响应及必要元数据，供定位 JSON 结构问题；不保存 API Key。"""
+    """保存 API 原始响应及必要元数据用于诊断；不保存 API Key。"""
     try:
         debug = {
             "reason": reason,
@@ -300,27 +300,53 @@ def _save_api_debug(content: str, response_data: Dict[str, Any], reason: str) ->
             "finish_reason": ((response_data.get("choices") or [{}])[0].get("finish_reason")),
             "content": content,
         }
-        Path("deepseek_api_response_debug.txt").write_text(
+        Path("api_response_debug.txt").write_text(
             json.dumps(debug, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
         )
     except Exception:
-        # 诊断文件写入失败不应覆盖原始 API 错误。
         pass
 
 
-def deepseek_chat(api_base: str, api_key: str, model: str, messages: List[Dict[str, str]], max_tokens: int, timeout: int) -> Dict[str, Any]:
-    """调用 DeepSeek OpenAI-compatible Chat Completions API。"""
-    payload = {
+def build_chat_completions_url(api_base: str) -> str:
+    """允许填写 API Base URL，也允许直接填写完整的 chat/completions URL。"""
+    base = api_base.strip().rstrip("/")
+    if not base.startswith(("http://", "https://")):
+        raise ValueError("API Base URL 必须以 http:// 或 https:// 开头")
+    if base.endswith("/chat/completions"):
+        return base
+    return base + "/chat/completions"
+
+
+def chat_completions(
+    api_base: str,
+    api_key: str,
+    model: str,
+    messages: List[Dict[str, str]],
+    max_tokens: int,
+    timeout: int,
+    temperature: float,
+    response_format_json: bool,
+    extra_body: Dict[str, Any],
+) -> Dict[str, Any]:
+    """调用 OpenAI-compatible Chat Completions 接口。"""
+    payload: Dict[str, Any] = {
         "model": model,
         "messages": messages,
         "stream": False,
-        "response_format": {"type": "json_object"},
-        "thinking": {"type": "disabled"},
-        "temperature": 0,
+        "temperature": temperature,
         "max_tokens": max_tokens,
     }
+    if response_format_json:
+        payload["response_format"] = {"type": "json_object"}
+
+    reserved = {"model", "messages", "stream", "temperature", "max_tokens", "response_format"}
+    conflicts = reserved.intersection(extra_body)
+    if conflicts:
+        raise ValueError("extra_body 不允许覆盖这些请求字段：{}".format(", ".join(sorted(conflicts))))
+    payload.update(extra_body)
+
     request = urllib.request.Request(
-        api_base.rstrip("/") + "/chat/completions",
+        build_chat_completions_url(api_base),
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
         headers={
             "Content-Type": "application/json",
@@ -330,38 +356,43 @@ def deepseek_chat(api_base: str, api_key: str, model: str, messages: List[Dict[s
     )
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
-            data = json.loads(response.read().decode("utf-8"))
+            raw_response = response.read().decode("utf-8")
+            data = json.loads(raw_response)
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
         if exc.code == 401:
-            raise RuntimeError("DeepSeek API 401：API Key 无效或未正确设置 DEEPSEEK_API_KEY") from exc
+            raise RuntimeError("API HTTP 401：API Key 无效或没有访问权限。")
         if exc.code == 402:
-            raise RuntimeError("DeepSeek API 402：账户余额不足或账户未开通计费") from exc
+            raise RuntimeError("API HTTP 402：服务商账户余额不足或计费未开通。")
         if exc.code == 429:
-            raise RuntimeError("DeepSeek API 429：请求频率或并发限制，稍后重试。详情：{}".format(detail[:600])) from exc
-        raise RuntimeError("DeepSeek API HTTP {}：{}".format(exc.code, detail[:1000])) from exc
+            raise RuntimeError("API HTTP 429：请求频率或并发达到限制。详情：{}".format(detail[:600]))
+        raise RuntimeError("API HTTP {}：{}".format(exc.code, detail[:1000])) from exc
     except urllib.error.URLError as exc:
-        raise RuntimeError("无法连接 DeepSeek API：{}。请检查网络和 API Base URL。".format(exc.reason)) from exc
+        raise RuntimeError("无法连接 API：{}。请检查网络和 API Base URL。".format(exc.reason)) from exc
+    except (TimeoutError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise RuntimeError("API 请求超时或返回内容不是有效 UTF-8 JSON：{}".format(exc)) from exc
 
+    if not isinstance(data, dict):
+        raise RuntimeError("API 响应顶层必须是 JSON 对象")
     choices = data.get("choices") or []
-    if not choices:
-        raise RuntimeError("DeepSeek API 没有返回 choices：{}".format(json.dumps(data, ensure_ascii=False)[:1000]))
+    if not choices or not isinstance(choices[0], dict):
+        raise RuntimeError("API 响应缺少 choices[0]：{}".format(json.dumps(data, ensure_ascii=False)[:1000]))
     message = choices[0].get("message") or {}
     content = message.get("content")
     finish_reason = choices[0].get("finish_reason")
     if not isinstance(content, str) or not content.strip():
-        raise RuntimeError("DeepSeek API 返回空内容，finish_reason={!r}。可降低 batch-size/max-chars 或提高 max-tokens。".format(finish_reason))
+        raise RuntimeError("API 返回空内容，finish_reason={!r}。可降低 batch-size/max-chars 或提高 max-tokens。".format(finish_reason))
     if finish_reason == "length":
-        raise RuntimeError("DeepSeek 输出达到 max_tokens 上限，JSON 可能被截断。请降低 batch-size/max-chars 或提高 max-tokens。")
+        raise RuntimeError("模型输出达到 max_tokens 上限，JSON 可能被截断。请降低 batch-size/max-chars 或提高 max-tokens。")
     try:
         parsed = json.loads(content)
     except json.JSONDecodeError as exc:
         _save_api_debug(content, data, "invalid_json")
-        raise RuntimeError("DeepSeek 返回内容不是有效 JSON；原始响应已保存到 deepseek_api_response_debug.txt。内容开头：{}".format(content[:500])) from exc
+        raise RuntimeError("API 返回内容不是有效 JSON；原始响应已保存到 api_response_debug.txt。内容开头：{}".format(content[:500])) from exc
     if not isinstance(parsed, dict) or not isinstance(parsed.get("translations"), list):
         _save_api_debug(content, data, "wrong_json_shape")
         keys = list(parsed.keys()) if isinstance(parsed, dict) else type(parsed).__name__
-        raise RuntimeError("DeepSeek 返回了合法 JSON，但结构不符合预期：顶层={!r}，需要顶层 translations 数组。原始响应已保存到 deepseek_api_response_debug.txt；内容开头：{}".format(keys, content[:700]))
+        raise RuntimeError("API 返回合法 JSON，但结构不符合预期：顶层={!r}，需要顶层 translations 数组。原始响应已保存到 api_response_debug.txt；内容开头：{}".format(keys, content[:700]))
     return parsed
 
 
@@ -381,7 +412,18 @@ def make_batches(items: Sequence[Dict[str, Any]], batch_size: int, max_chars: in
     return batches
 
 
-def translate_batch(batch: List[Dict[str, Any]], model: str, api_base: str, api_key: str, glossary: Dict[str, str], max_tokens: int, timeout: int) -> Dict[str, Dict[str, str]]:
+def translate_batch(
+    batch: List[Dict[str, Any]],
+    model: str,
+    api_base: str,
+    api_key: str,
+    glossary: Dict[str, str],
+    max_tokens: int,
+    timeout: int,
+    temperature: float = 0.0,
+    response_format_json: bool = True,
+    extra_body: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Dict[str, str]]:
     payload_items = []
     for item in batch:
         payload_items.append({
@@ -414,17 +456,25 @@ def translate_batch(batch: List[Dict[str, Any]], model: str, api_base: str, api_
     last_error: Optional[Exception] = None
     for attempt in range(3):
         try:
-            response = deepseek_chat(api_base, api_key, model, messages, max_tokens, timeout)
+            response = chat_completions(
+                api_base, api_key, model, messages, max_tokens, timeout,
+                temperature, response_format_json, extra_body or {},
+            )
             allowed = {item["id"] for item in batch}
             result: Dict[str, Dict[str, str]] = {}
             for row in response["translations"]:
                 if not isinstance(row, dict):
-                    continue
+                    raise RuntimeError("模型返回的 translations 中包含非对象记录")
                 rid = row.get("id")
                 action = row.get("action")
                 text = row.get("text")
-                if rid in allowed and rid not in result and action in {"translate", "keep", "review"} and isinstance(text, str):
-                    result[rid] = {"action": action, "text": text}
+                if rid not in allowed:
+                    raise RuntimeError("模型返回了未知 ID：{!r}".format(rid))
+                if rid in result:
+                    raise RuntimeError("模型重复返回 ID：{}".format(rid))
+                if action not in {"translate", "keep", "review"} or not isinstance(text, str):
+                    raise RuntimeError("模型返回记录格式无效：{}".format(rid))
+                result[rid] = {"action": action, "text": text}
             missing = allowed - set(result)
             if missing:
                 raise RuntimeError("模型遗漏 {} 条记录；示例 ID {}".format(len(missing), next(iter(missing))))
@@ -436,29 +486,87 @@ def translate_batch(batch: List[Dict[str, Any]], model: str, api_base: str, api_
     raise RuntimeError("批次翻译失败：{}".format(last_error))
 
 
+def load_config(path: str) -> Dict[str, Any]:
+    """读取用户配置；首次运行时提示用户创建一份本地配置。"""
+    config_path = Path(path)
+    if not config_path.exists():
+        example_path = Path("translation_config.example.json")
+        if not example_path.exists():
+            raise FileNotFoundError("配置文件不存在：{}。请先复制 translation_config.example.json。".format(path))
+        example = load_json(str(example_path))
+        if not isinstance(example, dict):
+            raise ValueError("translation_config.example.json 顶层必须是 JSON 对象")
+        save_json(str(config_path), example)
+        print("[配置] 已创建 {}，请填写 API Base URL、Model 和 API Key 后重新运行。".format(path))
+        raise SystemExit(2)
+
+    config = load_json(path)
+    if not isinstance(config, dict):
+        raise ValueError("配置文件顶层必须是 JSON 对象：{}".format(path))
+    if not isinstance(config.get("extra_body", {}), dict):
+        raise ValueError("配置项 extra_body 必须是 JSON 对象")
+    if not isinstance(config.get("response_format_json", True), bool):
+        raise ValueError("配置项 response_format_json 必须是 true 或 false")
+    return config
+
+
 def main() -> int:
-    parser = argparse.ArgumentParser(description="通过 DeepSeek API 翻译提取器生成的 translate.json，不扫描 Pawn 源码文件。")
+    parser = argparse.ArgumentParser(
+        description="通过用户配置的 OpenAI-compatible Chat Completions API 翻译提取器生成的 JSON。"
+    )
+    parser.add_argument("--config", default=DEFAULT_CONFIG, help="API 配置文件，默认 translation_config.json")
     parser.add_argument("--json", default=DEFAULT_JSON, help="提取器生成的 JSON")
     parser.add_argument("--output", default=DEFAULT_OUTPUT, help="翻译后的 JSON")
     parser.add_argument("--review", default="translation_review.json", help="人工复核列表")
-    parser.add_argument("--cache", default=DEFAULT_CACHE, help="断点续翻缓存（与 Ollama 缓存分开）")
+    parser.add_argument("--cache", default=DEFAULT_CACHE, help="断点续翻缓存")
     parser.add_argument("--glossary", default=DEFAULT_GLOSSARY, help="术语表 JSON")
-    parser.add_argument("--model", default="deepseek-flash", help="DeepSeek API 模型名称，默认 deepseek-flash")
-    parser.add_argument("--api-base", default=DEFAULT_API_BASE, help="DeepSeek API Base URL")
-    parser.add_argument("--batch-size", type=int, default=8, help="每批字符串数")
-    parser.add_argument("--max-chars", type=int, default=5000, help="每批估算字符上限")
-    parser.add_argument("--max-tokens", type=int, default=4096, help="每次 API 响应最大输出 token 数")
-    parser.add_argument("--context-lines", type=int, default=2, help="从 JSON 中附带的前后行数")
-    parser.add_argument("--timeout", type=int, default=180, help="单次 API 请求超时秒数")
+    parser.add_argument("--model", default=None, help="覆盖配置文件中的 model")
+    parser.add_argument("--api-base", default=None, help="覆盖配置文件中的 api_base")
+    parser.add_argument("--api-key-env", default=None, help="指定 API Key 对应的环境变量名")
+    parser.add_argument("--batch-size", type=int, default=None, help="覆盖配置中的每批字符串数")
+    parser.add_argument("--max-chars", type=int, default=None, help="覆盖配置中的每批估算字符上限")
+    parser.add_argument("--max-tokens", type=int, default=None, help="覆盖配置中的最大输出 token 数")
+    parser.add_argument("--context-lines", type=int, default=None, help="覆盖配置中的上下文行数")
+    parser.add_argument("--timeout", type=int, default=None, help="覆盖配置中的请求超时秒数")
     parser.add_argument("--max-items", type=int, default=0, help="仅翻译前 N 个字符串；0 表示全部")
     parser.add_argument("--no-resume", action="store_true", help="忽略已有缓存，重新翻译")
-    parser.add_argument("--export-cache-only", action="store_true", help="只使用现有缓存生成预览 JSON，不调用 DeepSeek API")
+    parser.add_argument("--export-cache-only", action="store_true", help="只使用现有缓存生成预览 JSON，不调用 API")
     args = parser.parse_args()
-    if args.batch_size < 1 or args.max_chars < 500 or args.max_tokens < 256 or args.context_lines < 0:
-        parser.error("batch-size >= 1、max-chars >= 500、max-tokens >= 256、context-lines >= 0")
-    api_key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
-    if not args.export_cache_only and not api_key:
-        raise RuntimeError("没有设置环境变量 DEEPSEEK_API_KEY。请先在 PowerShell 设置 API Key，再运行脚本。")
+
+    config = load_config(args.config)
+    api_base = str(args.api_base or config.get("api_base", "")).strip()
+    model = str(args.model or config.get("model", "")).strip()
+    api_key_env = str(args.api_key_env or config.get("api_key_env", "TRANSLATION_API_KEY")).strip()
+    api_key = os.environ.get(api_key_env, "").strip() if api_key_env else ""
+    if not api_key:
+        api_key = str(config.get("api_key", "")).strip()
+
+    args.batch_size = args.batch_size if args.batch_size is not None else int(config.get("batch_size", 8))
+    args.max_chars = args.max_chars if args.max_chars is not None else int(config.get("max_chars", 5000))
+    args.max_tokens = args.max_tokens if args.max_tokens is not None else int(config.get("max_tokens", 4096))
+    args.context_lines = args.context_lines if args.context_lines is not None else int(config.get("context_lines", 2))
+    args.timeout = args.timeout if args.timeout is not None else int(config.get("timeout", 180))
+    temperature = float(config.get("temperature", 0))
+    response_format_json = config.get("response_format_json", True)
+    extra_body = config.get("extra_body", {})
+
+    if args.batch_size < 1 or args.max_chars < 500 or args.max_tokens < 256 or args.context_lines < 0 or args.timeout < 1:
+        parser.error("batch-size >= 1、max-chars >= 500、max-tokens >= 256、context-lines >= 0、timeout >= 1")
+    if not args.export_cache_only:
+        missing = []
+        if not api_base:
+            missing.append("api_base")
+        if not model:
+            missing.append("model")
+        if not api_key:
+            missing.append("api_key 或对应的环境变量")
+        if missing:
+            raise RuntimeError(
+                "配置不完整（{}）。请编辑 {}；API Key 可以填写在本地配置文件中，"
+                "也可以设置 {} 环境变量。".format("、".join(missing), args.config, api_key_env or "TRANSLATION_API_KEY")
+            )
+    elif not model:
+        model = "cache-preview"
 
     entries = load_json(args.json)
     if not isinstance(entries, list):
@@ -501,7 +609,18 @@ def main() -> int:
                 existing = cache.get(item_id)
                 # 已完成的翻译/保留/人工复核直接复用；请求失败或校验失败的记录允许下次重试。
                 cache_done = False
-                if existing and existing.get("source") == raw and not existing.get("error"):
+                if (
+                    existing
+                    and existing.get("source") == raw
+                    and (
+                        args.export_cache_only
+                        or (
+                            existing.get("api_base") == api_base
+                            and existing.get("model") == model
+                        )
+                    )
+                    and not existing.get("error")
+                ):
                     cached_action = existing.get("action")
                     cache_done = (
                         cached_action == "keep"
@@ -534,13 +653,18 @@ def main() -> int:
     batches = make_batches(work, args.batch_size, args.max_chars)
     print("JSON 记录：{}；字符串候选：{}；待请求：{}；批次：{}".format(len(entries), sum(len(scan_line_literals(e["original_line"])[0]) for e in entries), len(work), len(batches)))
     print("输入：{}（只读取此 JSON，不读取 .pwn/.inc 文件）".format(args.json))
-    print("API 模型：{} | thinking=disabled | batch_size={} | max_chars={} | max_tokens={}".format(args.model, args.batch_size, args.max_chars, args.max_tokens))
+    print("API 模型：{} | batch_size={} | max_chars={} | max_tokens={}".format(model, args.batch_size, args.max_chars, args.max_tokens))
 
     review_rows = list(parse_reviews)
+    parse_review_lines = {
+        (row.get("file"), row.get("line"))
+        for row in parse_reviews
+        if row.get("status") == "parse_review"
+    }
     for batch_no, batch in enumerate(batches, 1):
         print("[批次 {}/{}] {} 条字符串".format(batch_no, len(batches), len(batch)))
         try:
-            result = translate_batch(batch, args.model, args.api_base, api_key, glossary, args.max_tokens, args.timeout)
+            result = translate_batch(batch, model, api_base, api_key, glossary, args.max_tokens, args.timeout, temperature, response_format_json, extra_body)
         except Exception as exc:
             print("[停止] 本批连续请求失败：{}".format(exc))
             print("[保护] 已停止后续批次，避免继续发送无效 API 请求和产生额外费用。")
@@ -566,7 +690,7 @@ def main() -> int:
             cache[item["id"]] = {
                 "source": item["raw"], "action": action, "translated": translated,
                 "model_text": row["text"], "error": error, "file": item["file"],
-                "line": item["line"], "model": args.model,
+                "line": item["line"], "model": model, "api_base": api_base,
             }
             if error or action == "review":
                 review_rows.append({
@@ -588,7 +712,7 @@ def main() -> int:
         original_line = entry["original_line"]
         literals, _ = scan_line_literals(original_line)
         edits: List[Tuple[int, int, str]] = []
-        row_review = False
+        row_review = (filepath, line_num) in parse_review_lines
         for literal in literals:
             raw = literal["raw"]
             item_id = make_id(filepath, line_num, literal["start"], raw)
@@ -613,7 +737,10 @@ def main() -> int:
                 translated_strings += 1
 
         new_entry = dict(entry)
-        if edits:
+        if row_review:
+            # 同一源码行中任一字符串需要复核时，整行暂不回写，避免部分修改。
+            new_entry["translated_line"] = ""
+        elif edits:
             new_line = original_line
             for start, end, translated in sorted(edits, key=lambda edit: edit[0], reverse=True):
                 new_line = new_line[:start] + translated + new_line[end:]
@@ -645,7 +772,7 @@ def main() -> int:
     print("输出 JSON：{}".format(args.output))
     print("人工复核：{}".format(args.review))
     print("断点缓存：{}".format(args.cache))
-    print("注意：本程序通过 DeepSeek API 处理 translate.json，不读取或修改任何 Pawn 源码文件。请复核后再使用 GBK 回写器。")
+    print("注意：本程序通过配置的 API 处理 JSON，不读取或修改任何 Pawn 源码文件。请复核后再使用 GBK 回写器。")
     return 0
 
 
