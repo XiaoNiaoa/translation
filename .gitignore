@@ -1,0 +1,18 @@
+# Local API credentials
+translation_config.json
+
+# Generated data and caches
+translate.json
+translate.translated.json
+translation_cache.json
+deepseek_json_translation_cache.json
+translation_review.json
+translation_glossary.json
+api_response_debug.txt
+deepseek_api_response_debug.txt
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
